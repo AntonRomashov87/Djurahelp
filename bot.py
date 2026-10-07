@@ -281,12 +281,27 @@ def find_member(ms, name):
     return next((m for m in ms if any(p.startswith(st) for p in norm(m.get("name")).split())), None)
 
 
-# --- Трекер: відкрита база, документ users/anton
+# --- Трекер: документ users/anton. Якщо задано TRACKER_PASSWORD (+ пошта в налаштуваннях Джури або TRACKER_EMAIL) — заходимо з паролем,
+# інакше працюємо як раніше (поки база відкрита). Так можна закрити базу правилами Firebase, не зламавши бота.
 TRACKER_DOC = f"{fs_base(TRACKER)}/users/anton"
+TRACKER_PASSWORD = os.environ.get("TRACKER_PASSWORD", "")
+TRACKER_AUTH = {"token": None, "exp": 0}
+
+
+async def tracker_headers():
+    email = os.environ.get("TRACKER_EMAIL") or settings().get("trackerEmail")
+    if not (email and TRACKER_PASSWORD): return {}
+    if not (TRACKER_AUTH["token"] and time.time() < TRACKER_AUTH["exp"]):
+        st, d = await http_json("POST", f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={TRACKER['apiKey']}",
+                                json={"email": email, "password": TRACKER_PASSWORD, "returnSecureToken": True})
+        if st != 200: raise RuntimeError("Трекер не пустив бота: перевір пошту й TRACKER_PASSWORD")
+        TRACKER_AUTH.update(token=d["idToken"], exp=time.time() + int(d.get("expiresIn", 3600)) - 300)
+    return {"Authorization": f"Bearer {TRACKER_AUTH['token']}"}
 
 
 async def tracker_load():
-    st, d = await http_json("GET", f"{TRACKER_DOC}?key={TRACKER['apiKey']}")
+    st, d = await http_json("GET", f"{TRACKER_DOC}?key={TRACKER['apiKey']}", headers=await tracker_headers())
+    if st in (401, 403): raise RuntimeError("Трекер закритий: додай TRACKER_PASSWORD на Render і пошту трекера в налаштуваннях Джури")
     if st != 200: raise RuntimeError("Трекер недоступний")
     t = fs_fields(d)
     for k, dv in (("habits", []), ("data", {}), ("morningLog", {}), ("sleepLog", {}), ("financeLog", []), ("bookLog", []), ("eloHistory", [])):
@@ -296,14 +311,15 @@ async def tracker_load():
 
 async def tracker_set_path(segs, value):
     st, d = await http_json("PATCH", f"{TRACKER_DOC}?key={TRACKER['apiKey']}&updateMask.fieldPaths={fp(*segs)}",
-                            json={"fields": nested(segs, value)})
+                            json={"fields": nested(segs, value)}, headers=await tracker_headers())
     if st != 200: raise RuntimeError(f"Трекер не записав ({st})")
 
 
 async def tracker_append(field, value):
     name = f"projects/{TRACKER['projectId']}/databases/(default)/documents/users/anton"
     st, d = await http_json("POST", f"{fs_base(TRACKER)}:commit?key={TRACKER['apiKey']}", json={"writes": [
-        {"transform": {"document": name, "fieldTransforms": [{"fieldPath": field, "appendMissingElements": {"values": [fs_enc(value)]}}]}}]})
+        {"transform": {"document": name, "fieldTransforms": [{"fieldPath": field, "appendMissingElements": {"values": [fs_enc(value)]}}]}}]},
+        headers=await tracker_headers())
     if st != 200: raise RuntimeError(f"Трекер не записав ({st})")
 
 
