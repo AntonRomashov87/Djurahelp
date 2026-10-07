@@ -377,9 +377,12 @@ async def alerts_state():
 
 async def rates():
     st, d = await http_json("GET", "https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?json")
+    if not isinstance(d, list): return "Курс валют зараз недоступний."
     r = {x["cc"]: x["rate"] for x in d if x.get("cc") in ("USD", "EUR", "PLN")}
     f = lambda v: f"{v:.2f}".replace(".", ",")
-    return f"Курс НБУ: долар {f(r['USD'])}, євро {f(r['EUR'])}, злотий {f(r['PLN'])}."
+    names = (("USD", "долар"), ("EUR", "євро"), ("PLN", "злотий"))
+    parts = [f"{n} {f(r[c])}" for c, n in names if c in r]
+    return ("Курс НБУ: " + ", ".join(parts) + ".") if parts else "Курс валют зараз недоступний."
 
 
 async def np_status(numbers):
@@ -426,11 +429,42 @@ async def alt_chat(parts, system):
     text = " ".join(p.get("text", "") for p in parts if p.get("text"))
     if not text or any(p.get("inlineData") for p in parts): return None
     base, model = ALT[prov]
-    st, d = await http_json("POST", f"{base}/chat/completions", headers={"Authorization": f"Bearer {key}"},
-                            json={"model": s.get("altModel") or model, "temperature": 0.7,
-                                  "messages": [{"role": "system", "content": system}, {"role": "user", "content": text}]})
-    if st != 200: return None
-    return ((d.get("choices") or [{}])[0].get("message") or {}).get("content", "").strip() or None
+    hdr = {"Authorization": f"Bearer {key}"}
+    model = s.get("altModel") or ALT_AUTO.get(prov) or model
+    tried = []
+    for _ in range(3):
+        tried.append(model)
+        st, d = await http_json("POST", f"{base}/chat/completions", headers=hdr,
+                                json={"model": model, "temperature": 0.7,
+                                      "messages": [{"role": "system", "content": system}, {"role": "user", "content": text}]})
+        if st == 200:
+            return ((d.get("choices") or [{}])[0].get("message") or {}).get("content", "").strip() or None
+        msg = str((d.get("error") or {}).get("message", ""))
+        if st == 404 or re.search(r"does not exist|not found|no endpoints|decommissioned|do not have access", msg, re.I):
+            nxt = await alt_pick(prov, base, hdr, tried)
+            if not nxt: return None
+            model = ALT_AUTO[prov] = nxt; continue
+        return None
+    return None
+
+
+ALT_AUTO = {}
+ALT_PREFER = {"groq": ["openai/gpt-oss-120b", "llama-3.3-70b-versatile", "meta-llama/llama-4-maverick-17b-128e-instruct",
+                       "moonshotai/kimi-k2-instruct", "qwen/qwen3-32b", "openai/gpt-oss-20b", "llama-3.1-8b-instant"],
+              "openrouter": ["openai/gpt-oss-120b:free", "meta-llama/llama-3.3-70b-instruct:free", "deepseek/deepseek-chat-v3-0324:free",
+                             "qwen/qwen3-235b-a22b:free", "openai/gpt-oss-20b:free"]}
+
+
+async def alt_pick(prov, base, hdr, exclude):
+    """Моделі змінюються — питаємо в сервісу актуальний список і беремо найкращу."""
+    st, d = await http_json("GET", f"{base}/models", headers=hdr)
+    ids = [m.get("id") for m in (d.get("data") or []) if m.get("active", True) is not False]
+    ids = [i for i in ids if i and i not in exclude and not re.search(r"whisper|guard|tts|playai|orpheus|embed|compound|audio", i, re.I)]
+    if not ids: return None
+    hit = next((i for i in ALT_PREFER.get(prov, []) if i in ids), None)
+    if hit: return hit
+    if prov == "openrouter": return next((i for i in ids if i.endswith(":free")), None)
+    return ids[0]
 
 
 async def groq_whisper(audio):
@@ -508,7 +542,7 @@ async def local_command(text):
     low = t.lower().replace("’", "'").replace("ʼ", "'")
     if not low: return None
 
-    if re.fullmatch(r"(/start|/help|що ти вмієш|допомога|команди)", low): return HELP
+    if re.fullmatch(r"(/start|/help|що ти (вмієш|можеш)( робити)?|допомога|команди|твої команди)( без (gemini|джеміні|інтернету|мозку))?", low): return HELP
     if re.fullmatch(r"(привіт|вітаю|здоров|добр\S* (ранок|ранку|день|вечір|вечора))", low): return f"Вітаю, {addr_low()}! Чим допомогти?"
     if low == "слава україні": return "Героям слава!"
     if re.fullmatch(r"(котра (зараз )?година|скільки (зараз )?часу)", low): return f"{address()}, зараз {hhmm(now())}."
@@ -860,6 +894,12 @@ async def check_parcels(state):
         state["parcelStatus"] = seen; await bot_state_set({"parcelStatus": seen})
 
 
+def norm_hm(v, default):
+    m = re.match(r"^\s*(\d{1,2})[:.](\d{2})\s*$", str(v or ""))
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59: return default
+    return f"{int(m.group(1)):02d}:{m.group(2)}"
+
+
 async def scheduler():
     state = await bot_state(); last_parcels = 0
     while True:
@@ -868,8 +908,8 @@ async def scheduler():
             await check_reminders()
             await check_alerts(state)
             hm = hhmm(now()); today = ymd()
-            brief_at = settings().get("briefTime") or os.environ.get("BRIEF_TIME", "07:30")
-            eve_at = settings().get("eveningTime") or os.environ.get("EVENING_TIME", "21:00")
+            brief_at = norm_hm(settings().get("briefTime") or os.environ.get("BRIEF_TIME"), "07:30")
+            eve_at = norm_hm(settings().get("eveningTime") or os.environ.get("EVENING_TIME"), "21:00")
             if hm >= brief_at and state.get("lastBrief") != today and hm < "12:00":
                 state["lastBrief"] = today; await bot_state_set({"lastBrief": today})
                 await tg_send(await morning_brief())
@@ -938,7 +978,8 @@ async def handle_voice(chat, file_id):
 
 
 async def poll_telegram():
-    await http_json("POST", tg_url("deleteWebhook"), json={"drop_pending_updates": False})
+    try: await http_json("POST", tg_url("deleteWebhook"), json={"drop_pending_updates": False})
+    except Exception as e: log.warning("deleteWebhook: %s", e)
     offset = 0
     while True:
         try:
