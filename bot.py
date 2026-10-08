@@ -164,11 +164,14 @@ def tg_url(method):
     return f"https://api.telegram.org/bot{tok}/{method}"
 
 
-async def tg_send(text, chat=None):
+async def tg_send(text, chat=None, markup=None):
     chat = chat or settings().get("tgChat")
     if not chat: return
-    for part in [text[i:i + 3900] for i in range(0, len(text), 3900)] or [""]:
-        await http_json("POST", tg_url("sendMessage"), json={"chat_id": chat, "text": part, "disable_web_page_preview": True})
+    parts = [text[i:i + 3900] for i in range(0, len(text), 3900)] or [""]
+    for i, part in enumerate(parts):
+        body = {"chat_id": chat, "text": part, "disable_web_page_preview": True}
+        if markup and i == len(parts) - 1: body["reply_markup"] = markup
+        await http_json("POST", tg_url("sendMessage"), json=body)
 
 
 async def tg_action(chat, action="typing"):
@@ -431,6 +434,7 @@ async def gemini(parts, system):
             break
     alt = await alt_chat(parts, system)
     if alt is not None: return alt
+    await notify_problem("gemini", f"Gemini недоступний ({last or 'ліміт'}), запасний мозок теж не відповів. Працюють лише швидкі команди.")
     raise RuntimeError("Gemini недоступний або вичерпано денний ліміт")
 
 
@@ -563,6 +567,13 @@ async def local_command(text):
     if low == "слава україні": return "Героям слава!"
     if re.fullmatch(r"(котра (зараз )?година|скільки (зараз )?часу)", low): return f"{address()}, зараз {hhmm(now())}."
     if re.fullmatch(r"(/brief|звіт|ранковий звіт|брифінг)", low): return await morning_brief()
+    m = re.fullmatch(r"(?:що|які плани|які події)\s+(?:в|у)\s+(?:мене\s+(?:в|у)\s+)?календар\S*(?:\s+(сьогодні|завтра|післязавтра))?|(?:мій\s+)?календар(?:\s+(сьогодні|завтра|післязавтра))?", low)
+    if m:
+        if not calendar_id(): return "Календар до бота не підключений: потрібна змінна CALENDAR_ID на Render і розшарений календар (див. README)."
+        w = m.group(1) or m.group(2) or "сьогодні"
+        try: txt = await cal_day_text(parse_day(w))
+        except Exception as e: return f"Календар зараз недоступний: {e}"
+        return f"📅 {w.capitalize()}: {txt}"
     m = re.match(r"^(?:що|які плани)\s+(?:в|у)\s+мене(?:\s+(сьогодні|завтра|післязавтра|(?:в|у)\s+\S+))?$", low) or \
         re.match(r"^(?:мій\s+)?план(?:\s+дня)?(?:\s+на)?(?:\s+(сьогодні|завтра|післязавтра|\S+))?$", low)
     if m:
@@ -820,6 +831,11 @@ async def day_plan(day):
 
 async def morning_brief():
     parts = [f"☀️ Доброго ранку, {addr_low()}! Сьогодні {['неділя','понеділок','вівторок','середа','четвер','пʼятниця','субота'][js_weekday(now())]}, {now().strftime('%d.%m')}."]
+    if calendar_id():
+        try:
+            ct = await cal_day_text(now())
+            if ct: parts.append("📅 Календар: " + ct)
+        except Exception as e: log.warning("brief calendar: %s", e)
     for fn in (lambda: weather(False), rates):
         try: parts.append(await fn())
         except Exception as e: log.warning("brief part: %s", e)
@@ -910,6 +926,210 @@ async def check_parcels(state):
         state["parcelStatus"] = seen; await bot_state_set({"parcelStatus": seen})
 
 
+# ---------------------------------------------------------------- Сповіщення про збої
+PROBLEMS = {}
+
+
+async def notify_problem(key, text, cooldown=6 * 3600):
+    """Повідомляє господаря про збій, але не частіше, ніж раз на cooldown секунд для кожного ключа."""
+    t = time.time()
+    if t - PROBLEMS.get(key, 0) < cooldown: return
+    PROBLEMS[key] = t
+    try: await tg_send("⚠️ " + text)
+    except Exception as e: log.warning("notify_problem: %s", e)
+
+
+# ---------------------------------------------------------------- Кнопки в Telegram
+def pl(n, one, few, many):
+    n = abs(int(n)); 
+    if 11 <= n % 100 <= 14: return many
+    return one if n % 10 == 1 else few if 2 <= n % 10 <= 4 else many
+
+
+def kb(rows):
+    return {"inline_keyboard": [[{"text": t, "callback_data": d} for t, d in row] for row in rows]}
+
+
+MENU_ROWS = [[("☀️ Звіт", "cmd:звіт"), ("📋 План дня", "cmd:план на сьогодні")],
+             [("✅ Звички", "habits"), ("🧾 Платежі", "cmd:що треба оплатити")],
+             [("🚗 Авто", "cmd:авто"), ("🌦 Погода", "cmd:погода")],
+             [("🚨 Тривога?", "cmd:є тривога"), ("💱 Курс", "cmd:курс")],
+             [("📅 Календар", "cmd:що в календарі"), ("📦 Посилки", "cmd:посилки")],
+             [("💾 Бекап", "backup"), ("📊 Підсумок тижня", "weekly")]]
+
+
+async def send_menu(chat=None):
+    await tg_send("Що зробити, " + addr_low() + "?", chat, kb(MENU_ROWS))
+
+
+def habit_rows(left):
+    btns = [("⬜ " + short(h["name"])[:24], f"h:{h['id']}") for h in left[:12]]
+    return [btns[i:i + 2] for i in range(0, len(btns), 2)]
+
+
+async def send_habits(chat=None, intro=None):
+    tt = await tracker_load(); day = tt["data"].get(ymd()) or {}
+    left = [h for h in tt["habits"] if not day.get(str(h["id"]))]
+    total = len(tt["habits"]); done = total - len(left)
+    if not left:
+        await tg_send(f"{intro + ' ' if intro else ''}Усі {total} {pl(total, 'звичка', 'звички', 'звичок')} сьогодні виконано! 🏆", chat); return
+    await tg_send(f"{intro + ' ' if intro else ''}Сьогодні {done} з {total}. Тисни, що вже зроблено:", chat, kb(habit_rows(left)))
+
+
+async def mark_habit(chat, hid):
+    tt = await tracker_load()
+    h = next((x for x in tt["habits"] if str(x["id"]) == hid), None)
+    if not h: return await tg_send("Не знайшов цієї звички.", chat)
+    await tracker_set_path(["data", ymd(), str(h["id"])], True)
+    if re.search("заряд", h.get("name", ""), re.I): await tracker_set_path(["morningLog", ymd(), "exercise"], True)
+    if re.search("очей|очі", h.get("name", ""), re.I): await tracker_set_path(["morningLog", ymd(), "eyes"], True)
+    await send_habits(chat, f"✅ {short(h['name'])}.")
+
+
+async def handle_callback(cb):
+    chat = str(((cb.get("message") or {}).get("chat") or {}).get("id", ""))
+    try: await http_json("POST", tg_url("answerCallbackQuery"), json={"callback_query_id": cb["id"]})
+    except Exception: pass
+    if chat != str(settings().get("tgChat")): return
+    data = cb.get("data") or ""
+    try:
+        if data.startswith("cmd:"): await handle_text(chat, data[4:])
+        elif data == "habits": await send_habits(chat)
+        elif data.startswith("h:"): await mark_habit(chat, data[2:])
+        elif data == "backup": await send_backup(chat)
+        elif data == "weekly": await tg_send(await weekly_summary(), chat)
+        elif data == "menu": await send_menu(chat)
+    except Exception as e:
+        await tg_send(f"Халепа: {e}", chat)
+
+
+# ---------------------------------------------------------------- Резервна копія
+def _sanitized_settings(st):
+    return {k: v for k, v in (st or {}).items() if not re.search(r"key|token|pass|secret|fbconfig", k, re.I)}
+
+
+async def send_backup(chat=None):
+    chat = chat or settings().get("tgChat")
+    doc = dict(S.get("doc") or {})
+    doc["settings"] = _sanitized_settings(doc.get("settings"))
+    doc.pop("history", None)   # розмови з Джурою не потрібні, і вони важкі
+    data = {"exportedAt": now().isoformat(), "dzhura": doc}
+    try: data["tracker"] = await tracker_load()
+    except Exception as e: data["tracker"] = {"error": str(e)}
+    raw = json.dumps(data, ensure_ascii=False, indent=1, default=str).encode()
+    fd = aiohttp.FormData()
+    fd.add_field("chat_id", str(chat))
+    fd.add_field("caption", f"💾 Резервна копія Джури й трекера, {ymd()}. Ключі й паролі в неї не потрапляють.")
+    fd.add_field("document", raw, filename=f"dzhura-backup-{ymd()}.json", content_type="application/json")
+    async with S["session"].post(tg_url("sendDocument"), data=fd) as r:
+        if r.status != 200: raise RuntimeError(f"Telegram не прийняв файл ({r.status})")
+
+
+# ---------------------------------------------------------------- Підсумок тижня
+async def weekly_summary():
+    days = [ymd(now() - timedelta(days=i)) for i in range(6, -1, -1)]
+    parts = [f"📊 Підсумок тижня, {addr_low()}"]
+    try:
+        tt = await tracker_load(); hb = tt["habits"]
+        if hb:
+            counts = {h["id"]: sum(1 for d in days if (tt["data"].get(d) or {}).get(str(h["id"]))) for h in hb}
+            total = sum(counts.values()); pct = round(100 * total / (7 * len(hb)))
+            best = max(hb, key=lambda h: counts[h["id"]]); worst = min(hb, key=lambda h: counts[h["id"]])
+            parts.append(f"✅ Звички: {pct}% ({total} із {7 * len(hb)}). Найкраще — {short(best['name'])} ({counts[best['id']]}/7)" +
+                         (f", найслабше — {short(worst['name'])} ({counts[worst['id']]}/7)." if counts[worst['id']] < counts[best['id']] else "."))
+        sl = [(tt["sleepLog"].get(d) or {}).get("hours") for d in days]; sl = [x for x in sl if x]
+        if sl: parts.append(f"😴 Сон у середньому {sum(sl) / len(sl):.1f} год".replace(".", ",") + f" ({len(sl)} із 7 ночей записано).")
+        fin = [x for x in tt["financeLog"] if x.get("date") in days]
+        if fin:
+            exp = sum(x.get("amount", 0) for x in fin if x.get("type") != "income"); inc = sum(x.get("amount", 0) for x in fin if x.get("type") == "income")
+            parts.append(f"💸 Витрати {money(exp)} грн" + (f", доходи {money(inc)} грн" if inc else "") + ".")
+        pages = sum(x.get("pages", 0) for x in tt["bookLog"] if x.get("date") in days)
+        if pages: parts.append(f"📖 Читання: {pages} хв.")
+    except Exception as e:
+        parts.append("Трекер зараз недоступний.")
+        await notify_problem("tracker", f"Не можу прочитати трекер: {e}")
+    try:
+        c = car_status()
+        if c and c.get("fuel_month_uah"): parts.append(f"⛽ На пальне цього місяця {money(c['fuel_month_uah'])} грн.")
+    except Exception: pass
+    try:
+        soon = [b for b in await pult_bills_due() if b["in_days"] <= 7]
+        if soon: parts.append("🧾 Платежі на тиждень: " + "; ".join(f"{b['title']} — {money(b['amount'])} грн" for b in soon) + ".")
+    except Exception: pass
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------- Google Календар (через сервісний акаунт: календар треба розшарити на його пошту)
+CAL = {"creds": None, "cache": [], "at": 0}
+
+
+def calendar_id():
+    return os.environ.get("CALENDAR_ID") or settings().get("calendarId") or ""
+
+
+def _cal_token():
+    from google.oauth2 import service_account
+    from google.auth.transport.requests import Request
+    if CAL["creds"] is None:
+        CAL["creds"] = service_account.Credentials.from_service_account_info(
+            json.loads(os.environ["FIREBASE_SA_JSON"]), scopes=["https://www.googleapis.com/auth/calendar.readonly"])
+    if not CAL["creds"].valid: CAL["creds"].refresh(Request())
+    return CAL["creds"].token
+
+
+async def cal_events(t_from, t_to):
+    cid = calendar_id()
+    if not cid: return None
+    tok = await asyncio.to_thread(_cal_token)
+    from urllib.parse import quote, urlencode
+    q = urlencode({"timeMin": t_from.isoformat(), "timeMax": t_to.isoformat(), "singleEvents": "true", "orderBy": "startTime", "maxResults": 30})
+    st, d = await http_json("GET", f"https://www.googleapis.com/calendar/v3/calendars/{quote(cid)}/events?{q}", headers={"Authorization": f"Bearer {tok}"})
+    if st != 200: raise RuntimeError(f"Google Календар відповів {st}: {(d.get('error') or {}).get('message', '')}")
+    out = []
+    for e in d.get("items", []):
+        if e.get("status") == "cancelled": continue
+        st_ = e.get("start") or {}
+        if st_.get("dateTime"):
+            when = datetime.fromisoformat(st_["dateTime"].replace("Z", "+00:00")).astimezone(KYIV); allday = False
+        elif st_.get("date"):
+            when = datetime.fromisoformat(st_["date"]).replace(tzinfo=KYIV); allday = True
+        else: continue
+        out.append({"id": e.get("id"), "title": e.get("summary") or "(без назви)", "when": when, "allday": allday})
+    return out
+
+
+async def cal_day_text(day):
+    start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+    ev = await cal_events(start, start + timedelta(days=1))
+    if ev is None: return None
+    if not ev: return "У календарі порожньо."
+    return "; ".join((e["title"] if e["allday"] else f"{hhmm(e['when'])} {e['title']}") for e in ev) + "."
+
+
+async def check_calendar(state):
+    """Нагадує про події за годину і за 10 хвилин. Календар опитуємо раз на 5 хвилин."""
+    if not calendar_id(): return
+    if time.time() - CAL["at"] > 300:
+        CAL["at"] = time.time()
+        try: CAL["cache"] = await cal_events(now(), now() + timedelta(hours=3)) or []
+        except Exception as e:
+            CAL["cache"] = []
+            await notify_problem("calendar", f"Календар недоступний: {e}. Перевір, що календар розшарено на пошту сервісного акаунта (client_email з FIREBASE_SA_JSON) і задано CALENDAR_ID.")
+            return
+    sent = list(state.get("calSent") or []); changed = False
+    for e in CAL["cache"]:
+        if e["allday"]: continue
+        mins = (e["when"] - now()).total_seconds() / 60
+        for lead in (60, 10):
+            key = f"{e['id']}:{e['when'].isoformat()}:{lead}"
+            if 0 < mins <= lead and key not in sent:
+                sent.append(key); changed = True
+                if lead == 60 and mins < 30: continue   # подію додали пізно — вистачить нагадування за 10 хв
+                await tg_send(f"📅 Через {round(mins)} хв: {e['title']} ({hhmm(e['when'])})")
+    if changed:
+        state["calSent"] = sent[-200:]; await bot_state_set({"calSent": state["calSent"]})
+
+
 def norm_hm(v, default):
     m = re.match(r"^\s*(\d{1,2})[:.](\d{2})\s*$", str(v or ""))
     if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59: return default
@@ -940,10 +1160,25 @@ async def scheduler():
                     if soon:
                         await tg_send("🧾 Нагадую про оплату: " + "; ".join(f"{b['title']} — {money(b['amount'])} грн, " + ("завтра" if b["in_days"] == 1 else "післязавтра") for b in soon) + ".")
                 except Exception as e: log.warning("bills: %s", e)
+            habit_at = norm_hm(settings().get("habitRemindTime") or os.environ.get("HABIT_TIME"), "20:00")
+            if str(settings().get("habitRemindTime", "")).lower() != "off" and hm >= habit_at and hm < "23:00" and state.get("lastHabitNudge") != today:
+                state["lastHabitNudge"] = today; await bot_state_set({"lastHabitNudge": today})
+                try:
+                    tt = await tracker_load(); day = tt["data"].get(today) or {}
+                    left = [h for h in tt["habits"] if not day.get(str(h["id"]))]
+                    if left: await tg_send(f"🔔 {address()}, ще не відмічено {len(left)} з {len(tt['habits'])} звичок. Тисни, що вже зроблено:", None, kb(habit_rows(left)))
+                except Exception as e: await notify_problem("tracker", f"Не можу прочитати трекер для нагадування про звички: {e}")
+            if now().weekday() == 6 and hm >= norm_hm(os.environ.get("WEEKLY_TIME"), "20:30") and state.get("lastWeekly") != today:
+                state["lastWeekly"] = today; await bot_state_set({"lastWeekly": today})
+                await tg_send(await weekly_summary())
+                try: await send_backup()
+                except Exception as e: await notify_problem("backup", f"Резервна копія не надіслалась: {e}")
+            await check_calendar(state)
             if time.time() - last_parcels > 2 * 3600:
                 last_parcels = time.time(); await check_parcels(state)
         except Exception as e:
             log.exception("scheduler: %s", e)
+            await notify_problem("scheduler", f"Збій у фоновому циклі бота: {e}", 3600)
         await asyncio.sleep(30)
 
 
@@ -958,6 +1193,10 @@ async def keepalive():
 
 # ---------------------------------------------------------------- Обробка повідомлень Telegram
 async def handle_text(chat, text):
+    if re.fullmatch(r"/?(menu|меню|кнопки)", text.strip().lower()): return await send_menu(chat)
+    if re.fullmatch(r"/?(habits|звички)", text.strip().lower()): return await send_habits(chat)
+    if re.fullmatch(r"/?(backup|бекап|резервна копія)", text.strip().lower()): return await send_backup(chat)
+    if re.fullmatch(r"/?(weekly|підсумок тижня)", text.strip().lower()): return await tg_send(await weekly_summary(), chat)
     await tg_action(chat)
     try:
         r = await local_command(text)
@@ -969,6 +1208,7 @@ async def handle_text(chat, text):
         except Exception as e:
             r = f"Цього я без Gemini не зроблю, а він зараз недоступний ({e}). Напиши «що ти вмієш» — перелічу, що працює без нього."
     await tg_send(r or "Хм, не знайшов слів.", chat)
+    if text.strip().lower() in ("/start", "/help"): await send_menu(chat)
 
 
 async def handle_voice(chat, file_id):
@@ -1020,6 +1260,8 @@ async def poll_telegram():
             st, d = await http_json("GET", tg_url("getUpdates") + f"?timeout=25&offset={offset}")
             for u in d.get("result", []):
                 offset = u["update_id"] + 1
+                if u.get("callback_query"):
+                    asyncio.create_task(handle_callback(u["callback_query"])); continue
                 msg = u.get("message") or {}
                 chat = str((msg.get("chat") or {}).get("id", ""))
                 if not chat: continue
@@ -1074,6 +1316,12 @@ async def main():
     if not st.get("welcomed"):
         await tg_send("🛡️ Джура на посту: нагадування, тривоги, ранковий звіт і Telegram-команди працюють цілодобово. Напиши «що ти вмієш».")
         await bot_state_set({"welcomed": True})
+    try:
+        await http_json("POST", tg_url("setMyCommands"), json={"commands": [
+            {"command": "menu", "description": "Меню з кнопками"}, {"command": "habits", "description": "Звички на сьогодні"},
+            {"command": "brief", "description": "Ранковий звіт"}, {"command": "weekly", "description": "Підсумок тижня"},
+            {"command": "backup", "description": "Резервна копія"}]})
+    except Exception as e: log.warning("setMyCommands: %s", e)
     await asyncio.gather(poll_telegram(), scheduler(), keepalive())
 
 
