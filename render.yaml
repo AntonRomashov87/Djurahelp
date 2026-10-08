@@ -18,3 +18,5 @@ services:
         sync: false
       - key: CALENDAR_ID
         sync: false
+      - key: HOME_KEY
+        sync: false
