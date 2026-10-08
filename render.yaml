@@ -16,3 +16,5 @@ services:
         sync: false
       - key: TRACKER_PASSWORD
         sync: false
+      - key: CALENDAR_ID
+        sync: false
