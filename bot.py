@@ -28,6 +28,7 @@ KYIV = ZoneInfo("Europe/Kyiv")
 PORT = int(os.environ.get("PORT", "10000"))
 PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 PULT_PASSWORD = os.environ.get("PULT_PASSWORD", "")
+HOME_KEY = os.environ.get("HOME_KEY", "")   # спільний секрет бота й домашнього агента
 
 PULT = {"apiKey": "AIzaSyBuUZmVUsXqOBxUY_bN1f7DlmFaFsnqou8", "projectId": "familyromashov"}
 TRACKER = {"apiKey": "AIzaSyD9PCBz1mt8PWtfk900EsuqTbPPBO-xMXA", "projectId": "chess-life-tracker"}
@@ -554,13 +555,15 @@ HELP = ("Тут, у Telegram, я вмію: «що в мене завтра», «
         "«нагадай о 18:00 …», «нагадай через 20 хвилин …», «які нагадування»; «запиши …», «нотатки»; "
         "Пульт: «купи молоко й хліб», «що купити», «купив молоко», «що в Злати завтра», «скажи родині …»; "
         "Трекер: «зробив тактику», «випив воду», «спав 7 годин», «витратив 300 на бензин», «що лишилось у трекері»; "
-        "«посилки». Голосові теж розумію. Решту питай — подумаю через Gemini.")
+        "«посилки»; дім: «увімкни світло в залі», «яскравість 40», «світло тепле», «сцена кіно», «вимкни телевізор», «гучніше». Голосові теж розумію. Решту питай — подумаю через Gemini.")
 
 
 async def local_command(text):
     t = re.sub(r"^(?:джур\S*)[,!\s]*", "", text.strip(), flags=re.I).rstrip(".!?…").strip()
     low = t.lower().replace("’", "'").replace("ʼ", "'")
     if not low: return None
+    r_home = await home_command(low)
+    if r_home: return r_home
 
     if re.fullmatch(r"(/start|/help|що ти (вмієш|можеш)( робити)?|допомога|команди|твої команди)( без (gemini|джеміні|інтернету|мозку))?", low): return HELP
     if re.fullmatch(r"(привіт|вітаю|здоров|добр\S* (ранок|ранку|день|вечір|вечора))", low): return f"Вітаю, {addr_low()}! Чим допомогти?"
@@ -955,6 +958,7 @@ MENU_ROWS = [[("☀️ Звіт", "cmd:звіт"), ("📋 План дня", "cmd
              [("🚗 Авто", "cmd:авто"), ("🌦 Погода", "cmd:погода")],
              [("🚨 Тривога?", "cmd:є тривога"), ("💱 Курс", "cmd:курс")],
              [("📅 Календар", "cmd:що в календарі"), ("📦 Посилки", "cmd:посилки")],
+             [("💡 Світло", "home:menu:light"), ("📺 Телевізор", "home:menu:tv")],
              [("💾 Бекап", "backup"), ("📊 Підсумок тижня", "weekly")]]
 
 
@@ -999,9 +1003,145 @@ async def handle_callback(cb):
         elif data == "backup": await send_backup(chat)
         elif data == "weekly": await tg_send(await weekly_summary(), chat)
         elif data == "menu": await send_menu(chat)
+        elif data.startswith("home:"): await home_callback(chat, data)
     except Exception as e:
         await tg_send(f"Халепа: {e}", chat)
 
+
+
+# ---------------------------------------------------------------- Домашній агент (лампи WiZ, телевізор)
+import hmac
+HOME = {"q": [], "res": {}, "seen": 0.0, "n": 0}
+
+def home_key_ok(request, body=None):
+    k = request.headers.get("X-Key") or request.query.get("key") or (body or {}).get("key") or ""
+    return bool(HOME_KEY) and hmac.compare_digest(str(k), HOME_KEY)
+
+async def home_do(action, args=None, wait=25):
+    """Кладе команду в чергу; планшет забирає її за секунду й відповідає."""
+    if not HOME_KEY: return "Домашнє керування не налаштоване: на Render немає змінної HOME_KEY (див. README)."
+    if time.time() - HOME["seen"] > 45: return "Домашній планшет зараз не на зв'язку. Перевір, чи запущений на ньому home_agent.py (Termux)."
+    HOME["n"] += 1; jid = str(HOME["n"])
+    fut = asyncio.get_running_loop().create_future(); HOME["res"][jid] = fut
+    HOME["q"].append({"id": jid, "action": action, "args": args or {}})
+    try: ok, text = await asyncio.wait_for(fut, wait)
+    except asyncio.TimeoutError:
+        HOME["q"] = [j for j in HOME["q"] if j["id"] != jid]
+        return "Планшет не відповів вчасно."
+    finally: HOME["res"].pop(jid, None)
+    return ("✅ " if ok else "⚠️ ") + text
+
+async def api_home_poll(request):
+    if not home_key_ok(request): return web.json_response({"error": "bad key"}, status=403)
+    HOME["seen"] = time.time()
+    if request.query.get("probe"): return web.json_response({"jobs": []})
+    end = time.time() + 20
+    while time.time() < end:
+        if HOME["q"]:
+            jobs, HOME["q"] = HOME["q"], []
+            return web.json_response({"jobs": jobs})
+        await asyncio.sleep(0.4); HOME["seen"] = time.time()
+    return web.json_response({"jobs": []})
+
+async def api_home_done(request):
+    try: body = await request.json()
+    except Exception: return web.json_response({"error": "bad json"}, status=400)
+    if not home_key_ok(request, body): return web.json_response({"error": "bad key"}, status=403)
+    HOME["seen"] = time.time()
+    fut = HOME["res"].get(str(body.get("id")))
+    if fut and not fut.done(): fut.set_result((bool(body.get("ok")), str(body.get("text") or "")[:500]))
+    return web.json_response({"ok": True})
+
+async def api_home(request):
+    """Для Джури в браузері: POST {key, text} або {key, action, args}."""
+    if request.method == "OPTIONS": return web.Response(headers=HCORS)
+    try: body = await request.json()
+    except Exception: return web.json_response({"error": "bad json"}, status=400, headers=HCORS)
+    if not home_key_ok(request, body): return web.json_response({"error": "Невірний ключ дому"}, status=403, headers=HCORS)
+    if body.get("text"):
+        r = await home_command(norm_home(body["text"]))
+        return web.json_response({"text": r or "Не зрозумів домашню команду."}, headers=HCORS)
+    return web.json_response({"text": await home_do(str(body.get("action")), body.get("args") or {})}, headers=HCORS)
+
+HCORS = {"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "POST, OPTIONS", "Access-Control-Allow-Headers": "*"}
+
+def norm_home(t):
+    t = re.sub(r"^(?:джур\S*)[,!\s]*", "", t.strip(), flags=re.I).rstrip(".!?…").strip()
+    return t.lower().replace("’", "'").replace("ʼ", "'")
+
+LIGHT_WORD = r"(?:світл\S*|ламп\S*|освітлення)"
+COLOR_WORD = r"(тепл\S*|холодн\S*|денн\S*|нейтральн\S*|червон\S*|зелен\S*|син\S*|жовт\S*|фіолетов\S*|рожев\S*|оранжев\S*|помаранчев\S*|біл\S*)"
+TV_WORD = r"(?:телевізор\S*|телік\S*|тв|tv)"
+TV_KEYMAP = {"вгору": "UP", "вниз": "DOWN", "вліво": "LEFT", "вправо": "RIGHT", "ок": "ENTER", "назад": "RETURN",
+             "додому": "HOME", "головна": "HOME", "джерело": "SOURCE", "меню": "MENU", "пауза": "PAUSE", "грай": "PLAY", "стоп": "STOP"}
+
+def _room(s):
+    s = (s or "").strip()
+    s = re.sub(r"^(?:в|у|на)\s+", "", s)
+    return s or None
+
+async def home_command(low):
+    """Повертає відповідь або None, якщо це не домашня команда."""
+    m = re.fullmatch(r"(?:що\s+(?:там\s+)?)?вдома|стан дому|статус дому|що в домі", low)
+    if m: return await home_do("status")
+    m = re.fullmatch(rf"(?:сцена|режим)\s+(.+)", low)
+    if m: return await home_do("scene", {"name": m.group(1)})
+    if low in ("на добраніч", "добраніч", "іду спати"): return await home_do("scene", {"name": "добраніч"})
+    if re.fullmatch(r"(?:кіно|режим кіно|давай кіно)", low): return await home_do("scene", {"name": "кіно"})
+    m = re.fullmatch(rf"(увімкни|включи|запали|вмикай|вимкни|виключи|погаси|гаси)\s+{LIGHT_WORD}(?:\s+(.+))?", low)
+    if m:
+        on = m.group(1) in ("увімкни", "включи", "запали", "вмикай")
+        return await home_do("light", {"on": on, "room": _room(m.group(2))})
+    m = re.fullmatch(rf"{LIGHT_WORD}\s+(?:на\s+)?(\d{{1,3}})\s*%?(?:\s+(?:в|у|на)\s+(.+))?", low) or \
+        re.fullmatch(r"яскравість\s+(?:на\s+)?(\d{1,3})\s*%?(?:\s+(?:в|у|на)\s+(.+))?", low)
+    if m: return await home_do("light", {"dim": int(m.group(1)), "room": _room(m.group(2))})
+    m = re.fullmatch(rf"(?:зроби\s+)?{LIGHT_WORD}\s+{COLOR_WORD}(?:\s+(?:в|у|на)\s+(.+))?", low)
+    if m: return await home_do("light", {"color": m.group(1), "room": _room(m.group(2))})
+    m = re.fullmatch(rf"(?:вимкни|виключи)\s+{TV_WORD}", low) or re.fullmatch(rf"{TV_WORD}\s+(?:вимкни|виключи)", low)
+    if m: return await home_do("tv", {"cmd": "OFF"})
+    m = re.fullmatch(rf"(?:увімкни|включи|запусти)\s+{TV_WORD}", low) or re.fullmatch(rf"{TV_WORD}\s+(?:увімкни|включи)", low)
+    if m: return await home_do("tv", {"cmd": "ON"})
+    m = re.fullmatch(rf"(?:{TV_WORD}\s+)?(гучніше|тихіше)(?:\s+(?:на\s+)?(\d+))?(?:\s+{TV_WORD})?", low)
+    if m: return await home_do("tv", {"cmd": "VOL_UP" if m.group(1) == "гучніше" else "VOL_DOWN", "n": int(m.group(2) or 3)})
+    if re.fullmatch(rf"(?:вимкни звук|без звуку|mute)(?:\s+{TV_WORD})?|{TV_WORD}\s+без звуку", low): return await home_do("tv", {"cmd": "MUTE"})
+    m = re.fullmatch(rf"{TV_WORD}\s+(вгору|вниз|вліво|вправо|ок|назад|додому|головна|джерело|меню|пауза|грай|стоп)", low)
+    if m: return await home_do("tv", {"cmd": TV_KEYMAP[m.group(1)]})
+    m = re.fullmatch(rf"{TV_WORD}\s+канал\s+(\d{{1,4}})", low)
+    if m:
+        for d in m.group(1): await home_do("tv", {"cmd": d})
+        return await home_do("tv", {"cmd": "ENTER"})
+    return None
+
+LIGHT_ROWS = [[("💡 Увімк", "home:l:on"), ("🌑 Вимк", "home:l:off")],
+              [("25%", "home:l:d25"), ("50%", "home:l:d50"), ("100%", "home:l:d100")],
+              [("🟠 Тепле", "home:l:тепле"), ("⚪ Денне", "home:l:денне"), ("🔵 Холодне", "home:l:холодне")],
+              [("🎬 Кіно", "home:s:кіно"), ("🌆 Вечір", "home:s:вечір")],
+              [("🌙 Добраніч", "home:s:добраніч"), ("☀️ Ранок", "home:s:ранок")],
+              [("🏠 Що вдома?", "home:st")]]
+TV_ROWS = [[("⏻ Увімк", "home:t:ON"), ("⏻ Вимк", "home:t:OFF")],
+           [("🔉 −", "home:t:VOL_DOWN"), ("🔇", "home:t:MUTE"), ("🔊 +", "home:t:VOL_UP")],
+           [("　", "home:t:NONE"), ("▲", "home:t:UP"), ("　", "home:t:NONE")],
+           [("◀", "home:t:LEFT"), ("OK", "home:t:ENTER"), ("▶", "home:t:RIGHT")],
+           [("　", "home:t:NONE"), ("▼", "home:t:DOWN"), ("　", "home:t:NONE")],
+           [("↩️ Назад", "home:t:RETURN"), ("🏠 Home", "home:t:HOME"), ("📥 Джерело", "home:t:SOURCE")]]
+
+async def home_callback(chat, data):
+    p = data.split(":")
+    if p[1] == "menu":
+        if p[2] == "light": return await tg_send("💡 Світло", chat, kb(LIGHT_ROWS))
+        return await tg_send("📺 Телевізор", chat, kb(TV_ROWS))
+    if p[1] == "st": return await tg_send(await home_do("status"), chat)
+    if p[1] == "s": return await tg_send(await home_do("scene", {"name": p[2]}), chat)
+    if p[1] == "t":
+        if p[2] == "NONE": return
+        r = await home_do("tv", {"cmd": p[2]})
+        if p[2] in ("ON", "OFF") or not r.startswith("✅"): await tg_send(r, chat)
+        return
+    if p[1] == "l":
+        v = p[2]
+        a = {"on": True} if v == "on" else {"on": False} if v == "off" else {"dim": int(v[1:])} if re.fullmatch(r"d\d+", v) else {"color": v}
+        r = await home_do("light", a)
+        return await tg_send(r, chat)
 
 # ---------------------------------------------------------------- Резервна копія
 def _sanitized_settings(st):
@@ -1310,6 +1450,7 @@ async def main():
     await refresh_doc()
     log.info("Джура: документ %s, чат %s", S["uid"], settings().get("tgChat"))
     app = web.Application(); app.router.add_get("/", health); app.router.add_get("/health", health); app.router.add_route("*", "/api/alerts", api_alerts)
+    app.router.add_get("/api/home/poll", api_home_poll); app.router.add_post("/api/home/done", api_home_done); app.router.add_route("*", "/api/home", api_home)
     runner = web.AppRunner(app); await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
     st = await bot_state()
