@@ -1063,6 +1063,121 @@ async def api_home(request):
         return web.json_response({"text": r or "Не зрозумів домашню команду."}, headers=HCORS)
     return web.json_response({"text": await home_do(str(body.get("action")), body.get("args") or {})}, headers=HCORS)
 
+
+# ---------------------------------------------------------------- Здоров'я (годинник → міст → бот)
+HCORS2 = {"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "*"}
+HEALTH_FIELDS = {"steps": int, "kcal": float, "km": float, "sleep_h": float, "hr_avg": float, "hr_rest": float, "spo2": float, "water": float}
+
+def _health_col():
+    return db.collection("dzhura_health")
+
+async def api_health(request):
+    """POST {key, date?, steps, kcal, km, sleep_h, hr_avg, hr_rest, spo2} — міст/Tasker/ручний імпорт.
+       GET ?key=&days=14 — для Джури в браузері."""
+    if request.method == "OPTIONS": return web.Response(headers=HCORS2)
+    body = {}
+    if request.method == "POST":
+        try: body = await request.json()
+        except Exception: return web.json_response({"error": "bad json"}, status=400, headers=HCORS2)
+    if not home_key_ok(request, body): return web.json_response({"error": "Невірний ключ"}, status=403, headers=HCORS2)
+    if request.method == "POST":
+        day = str(body.get("date") or datetime.now(ZoneInfo("Europe/Kyiv")).strftime("%Y-%m-%d"))[:10]
+        rec = {}
+        for k, t in HEALTH_FIELDS.items():
+            if body.get(k) not in (None, ""):
+                try: rec[k] = t(float(body[k]))
+                except Exception: pass
+        if not rec: return web.json_response({"error": "немає даних"}, status=400, headers=HCORS2)
+        rec["updated"] = time.time()
+        await asyncio.to_thread(lambda: _health_col().document(day).set(rec, merge=True))
+        return web.json_response({"ok": True, "date": day, "saved": rec}, headers=HCORS2)
+    n = max(1, min(60, int(request.query.get("days") or 14)))
+    def load():
+        out = {}
+        for d in _health_col().order_by("__name__", direction="DESCENDING").limit(n).stream():
+            out[d.id] = d.to_dict()
+        return out
+    return web.json_response({"days": await asyncio.to_thread(load)}, headers=HCORS2)
+
+
+# ---------------------------------------------------------------- Пошта (IMAP): сповіщення про нові листи
+import imaplib, email as _email
+from email.header import decode_header, make_header
+MAIL_HOST = os.environ.get("MAIL_HOST", "imap.ukr.net")
+MAIL_USER = os.environ.get("MAIL_USER", "")
+MAIL_PASS = os.environ.get("MAIL_PASS", "")        # пароль для зовнішніх програм (не основний!)
+MAIL_EVERY = max(60, int(os.environ.get("MAIL_EVERY", "120")))
+MAIL_IGNORE = [x.strip().lower() for x in os.environ.get("MAIL_IGNORE", "").split(",") if x.strip()]
+MAIL = {"uidnext": None, "items": [], "unseen": None, "err": "", "ok_at": 0.0}
+
+def _mdec(v):
+    try: return str(make_header(decode_header(v or ""))).replace("\n", " ").strip()
+    except Exception: return str(v or "")
+
+def _mail_check(uidnext):
+    """Блокуюча робота з IMAP. Лише заголовки, листи НЕ позначаються прочитаними."""
+    M = imaplib.IMAP4_SSL(MAIL_HOST, 993, timeout=30)
+    try:
+        M.login(MAIL_USER, MAIL_PASS)
+        typ, st = M.status("INBOX", "(UIDNEXT UNSEEN)")
+        txt = st[0].decode() if st and st[0] else ""
+        mn = re.search(r"UIDNEXT (\d+)", txt); mu = re.search(r"UNSEEN (\d+)", txt)
+        nxt = int(mn.group(1)) if mn else 0; unseen = int(mu.group(1)) if mu else None
+        new = []
+        if uidnext is not None and nxt > uidnext:
+            M.select("INBOX", readonly=True)
+            typ, data = M.uid("search", None, f"UID {uidnext}:*")
+            for u in (data[0].split() if data and data[0] else []):
+                if int(u) < uidnext: continue
+                typ, md = M.uid("fetch", u, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+                raw = next((x[1] for x in md if isinstance(x, tuple)), b"")
+                msg = _email.message_from_bytes(raw)
+                name, addr = email_utils_parse(msg.get("From", ""))
+                new.append({"uid": int(u), "from": name or addr, "addr": addr, "subject": _mdec(msg.get("Subject")) or "(без теми)"})
+        return {"next": nxt, "unseen": unseen, "new": new}
+    finally:
+        try: M.logout()
+        except Exception: pass
+
+def email_utils_parse(v):
+    from email.utils import parseaddr
+    n, a = parseaddr(_mdec(v)); return n.strip(), a.strip()
+
+async def mail_once():
+    r = await asyncio.to_thread(_mail_check, MAIL["uidnext"])
+    first = MAIL["uidnext"] is None
+    MAIL["uidnext"] = r["next"]; MAIL["unseen"] = r["unseen"]; MAIL["err"] = ""; MAIL["ok_at"] = time.time()
+    fresh = [m for m in r["new"] if not any(x in (m["addr"] + " " + m["from"]).lower() for x in MAIL_IGNORE)]
+    if not first and fresh:
+        now_ts = time.time()
+        for m in fresh: m["ts"] = now_ts; MAIL["items"].append(m)
+        MAIL["items"] = MAIL["items"][-30:]
+        lines = [f"📧 {m['from']}\n{m['subject']}" for m in fresh[:5]]
+        if len(fresh) > 5: lines.append(f"…і ще {len(fresh) - 5}")
+        await tg_send("Нова пошта (" + MAIL_USER + "):\n\n" + "\n\n".join(lines))
+    return fresh
+
+async def mail_watch():
+    if not (MAIL_USER and MAIL_PASS):
+        log.info("Пошта: MAIL_USER/MAIL_PASS не задано — стеження вимкнено"); return
+    log.info("Пошта: стежу за %s (%s) кожні %s с", MAIL_USER, MAIL_HOST, MAIL_EVERY)
+    while True:
+        try: await mail_once()
+        except Exception as e:
+            MAIL["err"] = str(e)[:200]; log.warning("Пошта: %s", e)
+        await asyncio.sleep(MAIL_EVERY)
+
+async def api_mail(request):
+    """GET ?key=&since=<unix ts> — нові листи для Джури в браузері."""
+    if request.method == "OPTIONS": return web.Response(headers=HCORS2)
+    if not home_key_ok(request): return web.json_response({"error": "Невірний ключ"}, status=403, headers=HCORS2)
+    if not (MAIL_USER and MAIL_PASS):
+        return web.json_response({"configured": False, "items": [], "now": time.time()}, headers=HCORS2)
+    try: since = float(request.query.get("since") or 0)
+    except ValueError: since = 0.0
+    items = [m for m in MAIL["items"] if m["ts"] > since]
+    return web.json_response({"configured": True, "items": items, "unseen": MAIL["unseen"], "error": MAIL["err"], "now": time.time()}, headers=HCORS2)
+
 HCORS = {"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "POST, OPTIONS", "Access-Control-Allow-Headers": "*"}
 
 def norm_home(t):
@@ -1450,7 +1565,7 @@ async def main():
     await refresh_doc()
     log.info("Джура: документ %s, чат %s", S["uid"], settings().get("tgChat"))
     app = web.Application(); app.router.add_get("/", health); app.router.add_get("/health", health); app.router.add_route("*", "/api/alerts", api_alerts)
-    app.router.add_get("/api/home/poll", api_home_poll); app.router.add_post("/api/home/done", api_home_done); app.router.add_route("*", "/api/home", api_home)
+    app.router.add_get("/api/home/poll", api_home_poll); app.router.add_post("/api/home/done", api_home_done); app.router.add_route("*", "/api/home", api_home); app.router.add_route("*", "/api/health", api_health); app.router.add_route("*", "/api/mail", api_mail)
     runner = web.AppRunner(app); await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
     st = await bot_state()
@@ -1463,7 +1578,7 @@ async def main():
             {"command": "brief", "description": "Ранковий звіт"}, {"command": "weekly", "description": "Підсумок тижня"},
             {"command": "backup", "description": "Резервна копія"}]})
     except Exception as e: log.warning("setMyCommands: %s", e)
-    await asyncio.gather(poll_telegram(), scheduler(), keepalive())
+    await asyncio.gather(poll_telegram(), scheduler(), keepalive(), mail_watch())
 
 
 if __name__ == "__main__":
