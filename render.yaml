@@ -20,3 +20,7 @@ services:
         sync: false
       - key: HOME_KEY
         sync: false
+      - key: MAIL_USER
+        sync: false
+      - key: MAIL_PASS
+        sync: false
